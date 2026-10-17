@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+build/
+coverage/
+*.log
+.DS_Store
+phase9b_backup/
+phase9d_backup/
+*.bak
