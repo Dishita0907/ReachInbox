@@ -1,0 +1,389 @@
+import { senderRouter } from "./senderRoutes.js";
+import { slackOAuthRouter } from "./slackOAuthRoutes.js";
+import express from "express";
+import type { Request, Response, NextFunction } from "express";
+import session from "express-session";
+import connectPgSimple from "connect-pg-simple";
+import { OAuth2Client, CodeChallengeMethod } from "google-auth-library";
+import { randomBytes } from "node:crypto";
+import { pool } from "./db.js";
+import { scheduleRouter } from "./scheduleRoutes.js";
+import { emailSearchRouter } from "./emailSearchRoutes.js";
+
+// Add our custom fields to Express sessions
+declare module "express-session" {
+  interface SessionData {
+    userId?: string;
+    oauthState?: string;
+    oauthNonce?: string;
+    oauthVerifier?: string;
+  }
+}
+
+const app = express();
+const PORT = Number(process.env.PORT ?? 4000);
+
+const clientId = process.env.GOOGLE_CLIENT_ID;
+const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+const callbackUrl = process.env.GOOGLE_CALLBACK_URL;
+const sessionSecret = process.env.SESSION_SECRET;
+
+if (!clientId || !clientSecret || !callbackUrl) {
+  throw new Error("Google OAuth credentials are missing");
+}
+
+if (!sessionSecret || sessionSecret.length < 32) {
+  throw new Error("SESSION_SECRET is missing or too short");
+}
+
+app.disable("x-powered-by");
+app.use(express.json());
+
+// Save user sessions in PostgreSQL
+const PgSession = connectPgSimple(session);
+
+app.use(
+  session({
+    name: "reachinbox.sid",
+    store: new PgSession({
+      pool,
+      tableName: "user_sessions",
+      createTableIfMissing: true
+    }),
+    secret: sessionSecret,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 24 * 60 * 60 * 1000
+    }
+  })
+);
+
+// Create Google OAuth client
+const googleClient = new OAuth2Client(
+  clientId,
+  clientSecret,
+  callbackUrl
+);
+
+// Protect endpoints that require login
+function requireAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
+  if (!req.session.userId) {
+    res.status(401).json({
+      status: "error",
+      message: "Please sign in first"
+    });
+    return;
+  }
+
+  next();
+}
+
+// Register authenticated email scheduling routes
+app.use("/api", scheduleRouter);
+app.use("/api", senderRouter);
+app.use("/auth/slack", slackOAuthRouter);
+app.use("/api", emailSearchRouter);
+
+// API 1: Backend health
+app.get("/api/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "reachinbox-backend",
+    message: "ReachInbox backend is running"
+  });
+});
+
+// API 2: Database health
+app.get("/api/db-health", async (_req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT current_database() AS database_name, current_user AS username"
+    );
+
+    res.json({
+      status: "ok",
+      message: "PostgreSQL connected successfully",
+      database: result.rows[0].database_name,
+      username: result.rows[0].username
+    });
+  } catch {
+    res.status(500).json({
+      status: "error",
+      message: "Database connection failed"
+    });
+  }
+});
+
+// API 3: Start Google login
+app.get("/auth/google", async (req, res) => {
+  try {
+    const { codeVerifier, codeChallenge } =
+      await googleClient.generateCodeVerifierAsync();
+
+    if (!codeChallenge) {
+      throw new Error("Unable to generate PKCE challenge");
+    }
+
+    const state = randomBytes(32).toString("hex");
+    const nonce = randomBytes(32).toString("hex");
+
+    req.session.oauthState = state;
+    req.session.oauthNonce = nonce;
+    req.session.oauthVerifier = codeVerifier;
+
+    const url = googleClient.generateAuthUrl({
+      response_type: "code",
+      access_type: "online",
+      scope: ["openid", "email", "profile"],
+      state,
+      nonce,
+      code_challenge: codeChallenge,
+      code_challenge_method: CodeChallengeMethod.S256,
+      prompt: "select_account"
+    });
+
+    req.session.save((error) => {
+      if (error) {
+        res.status(500).send("Unable to start login");
+        return;
+      }
+
+      res.redirect(url);
+    });
+  } catch (error) {
+    console.error("Login initialization failed:",
+      error instanceof Error ? error.message : "Unknown error"
+    );
+    res.status(500).send("Unable to start Google login");
+  }
+});
+
+// API 4: Google redirects here after login
+app.get("/auth/google/callback", async (req, res) => {
+  if (req.query.error) {
+    res.status(400).send("Google login was cancelled or denied");
+    return;
+  }
+
+  const code = req.query.code;
+  const state = req.query.state;
+
+  if (
+    typeof code !== "string" ||
+    typeof state !== "string" ||
+    !req.session.oauthState ||
+    !req.session.oauthNonce ||
+    !req.session.oauthVerifier ||
+    state !== req.session.oauthState
+  ) {
+    res.status(400).send("Invalid or expired login request");
+    return;
+  }
+
+  try {
+    const nonce = req.session.oauthNonce;
+    const codeVerifier = req.session.oauthVerifier;
+
+    // Remove one-time login values
+    delete req.session.oauthState;
+    delete req.session.oauthNonce;
+    delete req.session.oauthVerifier;
+
+    // Exchange Google's authorization code for tokens
+    const { tokens } = await googleClient.getToken({
+      code,
+      codeVerifier
+    });
+
+    if (!tokens.id_token) {
+      throw new Error("Google did not return an ID token");
+    }
+
+    // Verify Google's signed identity token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: clientId
+    });
+
+    const profile = ticket.getPayload();
+
+    if (
+      !profile ||
+      !profile.sub ||
+      !profile.email ||
+      profile.email_verified !== true ||
+      profile.nonce !== nonce
+    ) {
+      res.status(401).send("Google identity verification failed");
+      return;
+    }
+
+    // Create or update the authenticated user
+    const result = await pool.query(
+      `INSERT INTO users (
+         google_sub, email, display_name, avatar_url
+       )
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (google_sub)
+       DO UPDATE SET
+         email = EXCLUDED.email,
+         display_name = EXCLUDED.display_name,
+         avatar_url = EXCLUDED.avatar_url
+       RETURNING id`,
+      [
+        profile.sub,
+        profile.email,
+        profile.name ?? profile.email,
+        profile.picture ?? null
+      ]
+    );
+
+    const userId: string = result.rows[0].id;
+
+    // Give the authenticated user a new session ID
+    await new Promise<void>((resolve, reject) => {
+      req.session.regenerate((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+
+    req.session.userId = userId;
+
+    await new Promise<void>((resolve, reject) => {
+      req.session.save((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+
+    res.redirect("/auth/success");
+  } catch (error) {
+    console.error(
+      "Google login failed:",
+      error instanceof Error ? error.message : "Unknown error"
+    );
+
+    res.status(500).send("Google login failed. Check backend logs.");
+  }
+});
+
+// Temporary page for testing successful login
+app.get("/auth/success", requireAuth, (_req, res) => {
+  res.type("html").send(`
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <title>ReachInbox Login</title>
+      </head>
+      <body style="font-family:Arial;padding:40px">
+        <h1>Google Login Successful!</h1>
+        <p>You are authenticated with ReachInbox.</p>
+        <p><a href="/api/me">View My Profile</a></p>
+        <p><a href="/api/emails">View My Emails</a></p>
+        <form action="/auth/logout" method="post">
+          <button type="submit">Logout</button>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+// API 5: Return logged-in user's profile
+app.get("/api/me", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, email, display_name, avatar_url
+       FROM users
+       WHERE id = $1`,
+      [req.session.userId]
+    );
+
+    if (result.rows.length === 0) {
+      res.status(401).json({
+        status: "error",
+        message: "User not found"
+      });
+      return;
+    }
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      status: "ok",
+      user: result.rows[0]
+    });
+  } catch {
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load user profile"
+    });
+  }
+});
+
+// API 6: Only read the logged-in user's emails
+app.get("/api/emails", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         id,
+         recipient_email,
+         subject,
+         scheduled_at,
+         status,
+         sent_at
+       FROM email_jobs
+       WHERE user_id = $1
+       ORDER BY scheduled_at DESC
+       LIMIT 20`,
+      [req.session.userId]
+    );
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      status: "ok",
+      count: result.rows.length,
+      emails: result.rows
+    });
+  } catch {
+    res.status(500).json({
+      status: "error",
+      message: "Failed to retrieve emails"
+    });
+  }
+});
+
+// API 7: Logout
+app.post("/auth/logout", (req, res) => {
+  req.session.destroy((error) => {
+    if (error) {
+      res.status(500).send("Logout failed");
+      return;
+    }
+
+    res.clearCookie("reachinbox.sid", { path: "/" });
+    res.redirect("/auth/signed-out");
+  });
+});
+
+app.get("/auth/signed-out", (_req, res) => {
+  res.type("html").send(`
+    <h1>You have logged out successfully.</h1>
+    <a href="/auth/google">Sign in again</a>
+  `);
+});
+
+// Start the server
+app.listen(PORT, "127.0.0.1", () => {
+  console.log(
+    `ReachInbox backend running at http://localhost:${PORT}`
+  );
+});

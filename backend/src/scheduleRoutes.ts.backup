@@ -1,0 +1,244 @@
+import { Router } from "express";
+import { pool } from "./db.js";
+import { emailQueue } from "./emailQueue.js";
+
+export const scheduleRouter = Router();
+
+// POST /api/schedule
+scheduleRouter.post("/schedule", async (req, res) => {
+  // Step 1: Require Google login
+  const userId = req.session.userId;
+
+  if (!userId) {
+    res.status(401).json({
+      status: "error",
+      message: "Please sign in first"
+    });
+    return;
+  }
+
+  // Step 2: Read the request
+  const data = req.body;
+
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    res.status(400).json({
+      status: "error",
+      message: "A JSON request body is required"
+    });
+    return;
+  }
+
+  const {
+    senderId,
+    recipientEmail,
+    subject,
+    body,
+    scheduledAt,
+    idempotencyKey
+  } = data;
+
+  // Step 3: Validate input
+  const validUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  if (typeof senderId !== "string" || !validUuid.test(senderId)) {
+    res.status(400).json({
+      status: "error",
+      message: "A valid sender ID is required"
+    });
+    return;
+  }
+
+  if (
+    typeof recipientEmail !== "string" ||
+    recipientEmail.length > 320 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "A valid recipient email is required"
+    });
+    return;
+  }
+
+  if (
+    typeof subject !== "string" ||
+    !subject.trim() ||
+    subject.length > 200
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "A subject of up to 200 characters is required"
+    });
+    return;
+  }
+
+  if (
+    typeof body !== "string" ||
+    !body.trim() ||
+    body.length > 10000
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "A message body of up to 10000 characters is required"
+    });
+    return;
+  }
+
+  if (
+    typeof scheduledAt !== "string" ||
+    !/(?:Z|[+-]\d{2}:\d{2})$/i.test(scheduledAt)
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "Scheduled time must include a timezone"
+    });
+    return;
+  }
+
+  const scheduledTime = new Date(scheduledAt);
+
+  if (
+    Number.isNaN(scheduledTime.getTime()) ||
+    scheduledTime.getTime() <= Date.now() + 5 * 60 * 1000
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "Schedule the email at least 5 minutes in the future"
+    });
+    return;
+  }
+
+  if (
+    typeof idempotencyKey !== "string" ||
+    !/^[a-zA-Z0-9_-]{8,100}$/.test(idempotencyKey)
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "A unique idempotency key is required"
+    });
+    return;
+  }
+
+  try {
+    // Step 4: Ensure the sender belongs to this user
+    const sender = await pool.query(
+      `SELECT id FROM sender_accounts
+       WHERE id = $1 AND user_id = $2`,
+      [senderId, userId]
+    );
+
+    if (sender.rowCount === 0) {
+      res.status(403).json({
+        status: "error",
+        message: "Sender not found for this user"
+      });
+      return;
+    }
+
+    // Step 5: Store email in PostgreSQL
+    const inserted = await pool.query(
+      `INSERT INTO email_jobs (
+         user_id,
+         sender_id,
+         recipient_email,
+         subject,
+         body,
+         scheduled_at,
+         idempotency_key
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (user_id, idempotency_key)
+       DO NOTHING
+       RETURNING *`,
+      [
+        userId,
+        senderId,
+        recipientEmail,
+        subject,
+        body,
+        scheduledTime,
+        idempotencyKey
+      ]
+    );
+
+    const created = inserted.rowCount === 1;
+
+    let email = inserted.rows[0];
+
+    if (!created) {
+      const existing = await pool.query(
+        `SELECT * FROM email_jobs
+         WHERE user_id = $1 AND idempotency_key = $2`,
+        [userId, idempotencyKey]
+      );
+
+      email = existing.rows[0];
+
+      if (!email) {
+        throw new Error("Unable to find existing email job");
+      }
+
+      // Prevent a reused key from changing an email
+      if (
+        email.sender_id !== senderId ||
+        email.recipient_email !== recipientEmail ||
+        email.subject !== subject ||
+        email.body !== body ||
+        new Date(email.scheduled_at).getTime() !==
+          scheduledTime.getTime()
+      ) {
+        res.status(409).json({
+          status: "error",
+          message: "Idempotency key already used for a different email"
+        });
+        return;
+      }
+    }
+
+    // Never requeue an already processed email
+    if (email.status !== "scheduled") {
+      res.status(200).json({
+        status: "ok",
+        emailId: email.id,
+        emailStatus: email.status
+      });
+      return;
+    }
+
+    // Step 6: Add delayed job to BullMQ
+    const delay = Math.max(
+      0,
+      new Date(email.scheduled_at).getTime() - Date.now()
+    );
+
+    await emailQueue.add(
+      "send-email",
+      { emailJobId: email.id },
+      {
+        jobId: email.id,
+        delay,
+        removeOnComplete: false,
+        removeOnFail: false
+      }
+    );
+
+    res.status(created ? 201 : 200).json({
+      status: "ok",
+      message: created
+        ? "Email scheduled successfully"
+        : "Email was already scheduled",
+      emailId: email.id,
+      scheduledAt: email.scheduled_at,
+      emailStatus: email.status
+    });
+
+  } catch (error) {
+    console.error("Scheduling error:", error);
+
+    res.status(503).json({
+      status: "error",
+      message: "Scheduling failed. Retry with the same idempotency key."
+    });
+  }
+});

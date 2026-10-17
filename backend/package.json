@@ -1,0 +1,36 @@
+{
+  "name": "reachinbox-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bull-board/api": "^9.10.4",
+    "@bull-board/express": "^9.10.4",
+    "@elastic/elasticsearch": "^8.19.2",
+    "bullmq": "^6.3.16",
+    "connect-pg-simple": "^10.0.0",
+    "dotenv": "^18.0.8",
+    "express": "^5.1.0",
+    "express-session": "^1.19.0",
+    "google-auth-library": "^11.3.1",
+    "ioredis": "^6.0.0",
+    "nodemailer": "^10.1.2",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/connect-pg-simple": "^7.0.3",
+    "@types/express": "^5.0.3",
+    "@types/express-session": "^1.19.0",
+    "@types/node": "^24.0.0",
+    "@types/nodemailer": "^8.0.2",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

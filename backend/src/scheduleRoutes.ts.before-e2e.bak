@@ -1,0 +1,489 @@
+import { Router } from "express";
+import { pool } from "./db.js";
+import { emailQueue } from "./emailQueue.js";
+
+export const scheduleRouter = Router();
+
+// POST /api/schedule
+scheduleRouter.post("/schedule", async (req, res) => {
+  // Step 1: Require Google login
+  const userId = req.session.userId;
+
+  if (!userId) {
+    res.status(401).json({
+      status: "error",
+      message: "Please sign in first"
+    });
+    return;
+  }
+
+  // Step 2: Read the request
+  const data = req.body;
+
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    res.status(400).json({
+      status: "error",
+      message: "A JSON request body is required"
+    });
+    return;
+  }
+
+  const {
+    senderId,
+    recipientEmail,
+    subject,
+    body,
+    scheduledAt,
+    idempotencyKey
+  } = data;
+
+  // Step 3: Validate input
+  const validUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  if (typeof senderId !== "string" || !validUuid.test(senderId)) {
+    res.status(400).json({
+      status: "error",
+      message: "A valid sender ID is required"
+    });
+    return;
+  }
+
+  if (
+    typeof recipientEmail !== "string" ||
+    recipientEmail.length > 320 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "A valid recipient email is required"
+    });
+    return;
+  }
+
+  if (
+    typeof subject !== "string" ||
+    !subject.trim() ||
+    subject.length > 200
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "A subject of up to 200 characters is required"
+    });
+    return;
+  }
+
+  if (
+    typeof body !== "string" ||
+    !body.trim() ||
+    body.length > 10000
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "A message body of up to 10000 characters is required"
+    });
+    return;
+  }
+
+  if (
+    typeof scheduledAt !== "string" ||
+    !/(?:Z|[+-]\d{2}:\d{2})$/i.test(scheduledAt)
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "Scheduled time must include a timezone"
+    });
+    return;
+  }
+
+  const scheduledTime = new Date(scheduledAt);
+
+  if (
+    Number.isNaN(scheduledTime.getTime()) ||
+    scheduledTime.getTime() <= Date.now() + 5 * 60 * 1000
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "Schedule the email at least 5 minutes in the future"
+    });
+    return;
+  }
+
+  if (
+    typeof idempotencyKey !== "string" ||
+    !/^[a-zA-Z0-9_-]{8,100}$/.test(idempotencyKey)
+  ) {
+    res.status(400).json({
+      status: "error",
+      message: "A unique idempotency key is required"
+    });
+    return;
+  }
+
+  try {
+    // Step 4: Ensure the sender belongs to this user
+    const sender = await pool.query(
+      `SELECT id FROM sender_accounts
+       WHERE id = $1 AND user_id = $2`,
+      [senderId, userId]
+    );
+
+    if (sender.rowCount === 0) {
+      res.status(403).json({
+        status: "error",
+        message: "Sender not found for this user"
+      });
+      return;
+    }
+
+    // Step 5: Store email in PostgreSQL
+    const inserted = await pool.query(
+      `INSERT INTO email_jobs (
+         user_id,
+         sender_id,
+         recipient_email,
+         subject,
+         body,
+         scheduled_at,
+         idempotency_key
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (user_id, idempotency_key)
+       DO NOTHING
+       RETURNING *`,
+      [
+        userId,
+        senderId,
+        recipientEmail,
+        subject,
+        body,
+        scheduledTime,
+        idempotencyKey
+      ]
+    );
+
+    const created = inserted.rowCount === 1;
+
+    let email = inserted.rows[0];
+
+    if (!created) {
+      const existing = await pool.query(
+        `SELECT * FROM email_jobs
+         WHERE user_id = $1 AND idempotency_key = $2`,
+        [userId, idempotencyKey]
+      );
+
+      email = existing.rows[0];
+
+      if (!email) {
+        throw new Error("Unable to find existing email job");
+      }
+
+      // Prevent a reused key from changing an email
+      if (
+        email.sender_id !== senderId ||
+        email.recipient_email !== recipientEmail ||
+        email.subject !== subject ||
+        email.body !== body ||
+        new Date(email.scheduled_at).getTime() !==
+          scheduledTime.getTime()
+      ) {
+        res.status(409).json({
+          status: "error",
+          message: "Idempotency key already used for a different email"
+        });
+        return;
+      }
+    }
+
+    // Never requeue an already processed email
+    if (email.status !== "scheduled") {
+      res.status(200).json({
+        status: "ok",
+        emailId: email.id,
+        emailStatus: email.status
+      });
+      return;
+    }
+
+    // Step 6: Add delayed job to BullMQ
+    const delay = Math.max(
+      0,
+      new Date(email.scheduled_at).getTime() - Date.now()
+    );
+
+    await emailQueue.add(
+      "send-email",
+      { emailJobId: email.id },
+      {
+        jobId: email.id,
+        delay,
+        removeOnComplete: false,
+        removeOnFail: false
+      }
+    );
+
+    res.status(created ? 201 : 200).json({
+      status: "ok",
+      message: created
+        ? "Email scheduled successfully"
+        : "Email was already scheduled",
+      emailId: email.id,
+      scheduledAt: email.scheduled_at,
+      emailStatus: email.status
+    });
+
+  } catch (error) {
+    console.error("Scheduling error:", error);
+
+    res.status(503).json({
+      status: "error",
+      message: "Scheduling failed. Retry with the same idempotency key."
+    });
+  }
+});
+
+// Temporary development-only scheduling form.
+// Remove this route before production deployment.
+if (process.env.NODE_ENV === "development") {
+  scheduleRouter.get("/dev/schedule-form", async (req, res) => {
+    const userId = req.session.userId;
+
+    if (!userId) {
+      res.status(401).send(
+        'Please <a href="/auth/google">sign in with Google</a> first.'
+      );
+      return;
+    }
+
+    try {
+      const result = await pool.query(
+        `SELECT id, from_email, display_name
+         FROM sender_accounts
+         WHERE user_id = $1
+         ORDER BY created_at`,
+        [userId]
+      );
+
+      // Escape text before adding it to HTML.
+      const escapeHtml = (value: string) =>
+        value.replace(/[&<>"']/g, (char) => {
+          const replacements: Record<string, string> = {
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;"
+          };
+          return replacements[char];
+        });
+
+      const senderOptions = result.rows.map((sender) => {
+        const name = escapeHtml(
+          sender.display_name || sender.from_email
+        );
+        const email = escapeHtml(sender.from_email);
+        const id = escapeHtml(sender.id);
+
+        return '<option value="' + id + '">' +
+          name + ' (' + email + ')</option>';
+      }).join("");
+
+      res.set("Cache-Control", "no-store");
+
+      res.type("html").send(`
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReachInbox Scheduling Test</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f5f9;
+      margin: 0;
+      padding: 35px 15px;
+    }
+
+    .container {
+      max-width: 560px;
+      margin: auto;
+      padding: 28px;
+      background: white;
+      border-radius: 14px;
+      box-shadow: 0 4px 20px #00000012;
+    }
+
+    h1 {
+      color: #252a45;
+      font-size: 24px;
+    }
+
+    label {
+      display: block;
+      margin-top: 18px;
+      margin-bottom: 7px;
+      font-weight: bold;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      padding: 11px;
+      box-sizing: border-box;
+      border: 1px solid #ccd0df;
+      border-radius: 7px;
+      font: inherit;
+    }
+
+    textarea {
+      min-height: 110px;
+    }
+
+    button {
+      background: #5644d8;
+      color: white;
+      padding: 13px;
+      border: none;
+      border-radius: 8px;
+      margin-top: 23px;
+      cursor: pointer;
+      width: 100%;
+      font-weight: bold;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: #f0f2f7;
+      padding: 14px;
+      border-radius: 8px;
+    }
+
+    .note {
+      color: #656b7e;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>ReachInbox - Schedule Test Email</h1>
+    <p class="note">
+      Development-only form. No emails are sent yet.
+    </p>
+
+    <form id="emailForm">
+      <label for="sender">Sender</label>
+      <select id="sender" required>
+        ${senderOptions}
+      </select>
+
+      <label for="recipient">Recipient</label>
+      <input
+        id="recipient"
+        type="email"
+        value="recipient@example.test"
+        required
+      >
+
+      <label for="subject">Subject</label>
+      <input
+        id="subject"
+        value="ReachInbox Scheduling Test"
+        required
+      >
+
+      <label for="body">Message</label>
+      <textarea id="body" required>This is my first scheduled email.</textarea>
+
+      <label for="scheduledAt">Scheduled time</label>
+      <input id="scheduledAt" type="datetime-local" required>
+
+      <button type="submit" id="submitButton"
+        ${result.rows.length === 0 ? "disabled" : ""}>
+        Schedule Test Email
+      </button>
+    </form>
+
+    <h3>API Response</h3>
+    <pre id="result">No email scheduled yet.</pre>
+  </div>
+
+  <script>
+    const form = document.getElementById("emailForm");
+    const resultBox = document.getElementById("result");
+    const submitButton = document.getElementById("submitButton");
+
+    // Default: approximately 24 hours from now.
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const localTime = new Date(
+      future.getTime() - future.getTimezoneOffset() * 60000
+    );
+
+    document.getElementById("scheduledAt").value =
+      localTime.toISOString().slice(0, 16);
+
+    // Keep the same key when retrying this submission.
+    let idempotencyKey = crypto.randomUUID();
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const scheduledValue =
+        document.getElementById("scheduledAt").value;
+
+      const payload = {
+        senderId: document.getElementById("sender").value,
+        recipientEmail: document.getElementById("recipient").value,
+        subject: document.getElementById("subject").value,
+        body: document.getElementById("body").value,
+        scheduledAt: new Date(scheduledValue).toISOString(),
+        idempotencyKey
+      };
+
+      submitButton.disabled = true;
+      resultBox.textContent = "Scheduling...";
+
+      try {
+        const response = await fetch("/api/schedule", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await response.json();
+
+        resultBox.textContent =
+          "HTTP " + response.status + "\\n" +
+          JSON.stringify(data, null, 2);
+
+        if (response.ok) {
+          submitButton.textContent = "Email Scheduled";
+        } else {
+          submitButton.disabled = false;
+        }
+      } catch (error) {
+        resultBox.textContent = "Request failed: " + error.message;
+        submitButton.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+      `);
+    } catch (error) {
+      console.error("Unable to load test form:", error);
+
+      res.status(500).send("Unable to load scheduling form");
+    }
+  });
+}

@@ -1,0 +1,13 @@
+ReachInbox Documentation Pack
+============================
+1) In a free VS Code terminal (not the worker/frontend terminal):
+
+cd ~/Desktop/ReachInbox-Submission
+unzip -n ~/Downloads/reachinbox-documentation.zip -d .
+python3 prepare_env_example.py
+ls -lh README.md backend/.env.example
+
+2) Review the README and scan copied source code for accidentally embedded secrets before upload.
+3) Do not upload backend/.env, .git, node_modules, dist, builds, or local backups.
+
+The helper reads backend/src and your working backend/.env KEY NAMES ONLY; it never copies values.
